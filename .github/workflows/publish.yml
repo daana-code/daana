@@ -1,0 +1,115 @@
+name: Publish a release
+# Publishes a Daana CLI release that the source repository has already built,
+# qualified and prepared. A "prepare" run there uploads one artifact, the
+# publish bundle. This run takes exactly those bytes, checks them again and
+# publishes them here. Approving the `release` environment deployment is the
+# GO. Nothing is built here.
+#
+# mode=rehearse makes a draft (drafts are not public) and never publishes.
+#
+# Actions logs here are public: publish.py prints only fixed codes, asset
+# names, sizes, SHA-256s, numeric IDs and tags.
+# Shown on the run and in the deployment review: check it before approving.
+run-name: ${{ inputs.mode }} ${{ inputs.release_tag }} from prepare run ${{ inputs.prepare_run_id }}
+on:
+  workflow_dispatch:
+    inputs:
+      prepare_run_id:
+        description: The source repository's prepare run that uploaded the publish bundle (Actions run ID)
+        type: string
+        required: true
+      release_tag:
+        description: The tag to publish, for example v1.0.0-rc.1
+        type: string
+        required: true
+      mode:
+        description: rehearse makes a draft and never publishes
+        type: choice
+        default: rehearse
+        options: [rehearse, publish]
+
+permissions: {}
+
+concurrency:
+  group: release-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish the prepared bundle
+    if: github.ref == 'refs/heads/main'
+    environment: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read # the preflight reads this environment's protection
+    steps:
+      - name: Checkout main
+        id: checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      # After the approval, before any key is used: the GO is one person's,
+      # admins cannot bypass it, and only main deploys.
+      - name: Check the release environment's protection
+        id: preflight
+        env:
+          PREFLIGHT_TOKEN: ${{ github.token }}
+          RELEASE_REQUIRED_REVIEWER: ${{ vars.RELEASE_REQUIRED_REVIEWER }}
+        run: python3 -I -B .github/scripts/publish.py preflight --repo daana-code/daana --environment release
+
+      # A one-hour token for the source repository only, Actions read only.
+      - name: Mint the reader token
+        id: reader-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ vars.RELEASE_READER_APP_ID }}
+          private-key: ${{ secrets.RELEASE_READER_PRIVATE_KEY }}
+          owner: daana-code
+          repositories: daana-cli
+          permission-actions: read
+
+      # The run must be a successful dispatch of the prepare workflow on main;
+      # its one bundle is downloaded by ID and checked file by file.
+      - name: Fetch and verify the prepared bundle
+        id: fetch
+        env:
+          READER_TOKEN: ${{ steps.reader-token.outputs.token }}
+          PREPARE_RUN_ID: ${{ inputs.prepare_run_id }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          MODE: ${{ inputs.mode }}
+        run: python3 -I -B .github/scripts/publish.py fetch --run-id "$PREPARE_RUN_ID" --tag "$RELEASE_TAG" --mode "$MODE" --out "$RUNNER_TEMP/bundle"
+
+      # A one-hour token for this repository only, Contents write only, minted
+      # as late as possible.
+      - name: Mint the publisher token
+        id: app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: daana-code
+          repositories: daana
+          permission-contents: write
+
+      - name: Publish the verified bytes
+        id: publish
+        env:
+          PUBLISH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PREPARE_RUN_ID: ${{ inputs.prepare_run_id }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          MODE: ${{ inputs.mode }}
+        run: python3 -I -B .github/scripts/publish.py publish --repo daana-code/daana --tag "$RELEASE_TAG" --run-id "$PREPARE_RUN_ID" --mode "$MODE" --bundle "$RUNNER_TEMP/bundle" --receipt "$RUNNER_TEMP/publish-receipt.json"
+
+      # Written before the first upload, so a failure names exactly its draft.
+      - name: Keep the publish receipt
+        id: receipt
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-publish-receipt
+          path: ${{ runner.temp }}/publish-receipt.json
+          retention-days: 90
+          if-no-files-found: ignore
