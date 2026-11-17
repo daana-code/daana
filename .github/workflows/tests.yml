@@ -1,0 +1,32 @@
+name: Tests
+# The publisher's own tests, the required check `Publisher tests`. No
+# secret, no variable, no token, read-only, never the release environment.
+# No job-level `if`: GitHub counts a skipped job as passed. Pull requests from
+# forks wait for approval (Settings > Actions: all external contributors).
+on:
+  pull_request:
+
+permissions: {}
+
+jobs:
+  test:
+    name: Publisher tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned test dependency
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --require-hashes -r .github/tests/requirements.txt
+
+      - name: Run the tests
+        run: |
+          "$RUNNER_TEMP/venv/bin/python" -B .github/tests/test_publish.py
+          "$RUNNER_TEMP/venv/bin/python" -B .github/tests/test_workflow.py
