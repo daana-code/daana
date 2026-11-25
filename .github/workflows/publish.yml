@@ -6,6 +6,10 @@ name: Publish a release
 # GO. Nothing is built here.
 #
 # mode=rehearse makes a draft (drafts are not public) and never publishes.
+# mode=publish then deploys the release's docs: it dispatches the source
+# repository's docs deploy, waits for it and checks the docs site shows the
+# tag. A failure there leaves the release published and names the manual
+# re-dispatch.
 #
 # Actions logs here are public: publish.py prints only fixed codes, asset
 # names, sizes, SHA-256s, numeric IDs and tags.
@@ -40,7 +44,7 @@ jobs:
     if: github.ref == 'refs/heads/main'
     environment: release
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 75
     permissions:
       contents: read
       actions: read # the preflight reads this environment's protection
@@ -102,6 +106,35 @@ jobs:
           RELEASE_TAG: ${{ inputs.release_tag }}
           MODE: ${{ inputs.mode }}
         run: python3 -I -B .github/scripts/publish.py publish --repo daana-code/daana --tag "$RELEASE_TAG" --run-id "$PREPARE_RUN_ID" --mode "$MODE" --bundle "$RUNNER_TEMP/bundle" --receipt "$RUNNER_TEMP/publish-receipt.json"
+
+      # mode=publish only, after the publish step succeeded: a one-hour token
+      # for the source repository only, Actions write only, to dispatch its
+      # docs deploy. Its ID is a release environment variable, its key a
+      # release environment secret.
+      - name: Mint the docs dispatch token
+        id: docs-token
+        if: inputs.mode == 'publish'
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ vars.DOCS_DISPATCH_APP_ID }}
+          private-key: ${{ secrets.DOCS_DISPATCH_APP_PRIVATE_KEY }}
+          owner: daana-code
+          repositories: daana-cli
+          permission-actions: write
+
+      # Refuses unless the receipt records the confirmed publish of this tag.
+      # Never touches the release.
+      - name: Deploy the docs and check they are live
+        id: docs
+        if: inputs.mode == 'publish'
+        # Above the sum of publish.py's own bounds (2 + 20 + 5 minutes, each request
+        # at most 30 s), so its REFUSED line and the manual command always print.
+        timeout-minutes: 40
+        env:
+          DOCS_TOKEN: ${{ steps.docs-token.outputs.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          MODE: ${{ inputs.mode }}
+        run: python3 -I -B .github/scripts/publish.py docs --tag "$RELEASE_TAG" --mode "$MODE" --receipt "$RUNNER_TEMP/publish-receipt.json"
 
       # Written before the first upload, so a failure names exactly its draft.
       - name: Keep the publish receipt

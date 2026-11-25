@@ -19,6 +19,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import zipfile
 from datetime import datetime, timedelta, timezone
@@ -121,6 +122,19 @@ class FakeGitHub:
                                  'rules': [{'type': 'creation'}, {'type': 'update'}, {'type': 'deletion'}],
                                  'created_at': stamp(40), 'updated_at': stamp(30)}]
         self.run_artifacts = {RUN: [self.artifact(900)]}
+        # The source repository's docs deploy (deploy-docs.yml) and the public docs site.
+        self.docs_dispatches = []
+        self.docs_conclusion = 'success'
+        self.docs_polls = 2
+        self.docs_next = 8000
+        # What the site's version badge shows, one entry per page load; the last one repeats.
+        self.site_versions = [TAG]
+        self.site_page = None
+        # Runs the discovery must ignore: an older dispatch at the same tag, a push run, another ref, another workflow.
+        self.site_legacy = False
+        for run_id, change in ((7900, {'created_at': stamp(1 / 24)}), (7901, {'event': 'push'}), (7902, {'head_branch': 'main'}),
+                               (7903, {'path': '.github/workflows/ci.yml'})):
+            self.runs[run_id] = dict(self.docs_run(run_id, TAG), status='completed', conclusion='success', **change)
         fake = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -147,7 +161,9 @@ class FakeGitHub:
                 body = self._body()
                 fake.requests.append((method, url.path, dict(self.headers), body))
                 token = 'reader-token' if url.path.startswith(f'/repos/{SOURCE}/') else 'fake-token'
-                if not url.path.startswith('/s3/') and self.headers.get('Authorization') != f'Bearer {token}':
+                if url.path.startswith(f'/repos/{SOURCE}/actions/') and self.headers.get('Authorization') == 'Bearer docs-token':
+                    token = 'docs-token'
+                if not url.path.startswith(('/s3/', '/site/')) and self.headers.get('Authorization') != f'Bearer {token}':
                     return self._send(401, {'message': 'Bad credentials ' + SECRET})
                 return fake.handle(self, method, url, body)
 
@@ -189,6 +205,50 @@ class FakeGitHub:
                                        'name': tag, 'body': '', 'html_url': f'https://example.invalid/{tag}'}
         return self.releases[self.next_id]
 
+    def docs_run(self, run_id, ref):
+        return {'id': run_id, 'name': 'Deploy Docs', 'path': '.github/workflows/deploy-docs.yml', 'event': 'workflow_dispatch',
+                'head_branch': ref, 'head_sha': 'f' * 40 if 'docs-other-commit' in self.faults else 'c' * 40, 'status': 'queued', 'conclusion': None, 'run_attempt': 1,
+                'created_at': stamp(0), 'repository': {'full_name': SOURCE}, 'polled': 0}
+
+    def handle_docs(self, handler, method, path, body):
+        workflow = f'/repos/{SOURCE}/actions/workflows/deploy-docs.yml'
+        if method == 'POST' and path == workflow + '/dispatches':
+            if handler.headers.get('Authorization') != 'Bearer docs-token':
+                handler._send(403, {'message': 'Resource not accessible ' + SECRET})
+                return True
+            self.docs_dispatches.append(json.loads(body))
+            if 'docs-dispatch-500' in self.faults:
+                handler._send(500, {'message': 'Server Error ' + SECRET})
+                return True
+            ref = json.loads(body)['ref']
+            for _ in range(0 if 'docs-no-run' in self.faults else 2 if 'docs-two-runs' in self.faults else 1):
+                self.docs_next += 1
+                self.runs[self.docs_next] = self.docs_run(self.docs_next, ref)
+            handler._send(204, raw=b'')
+            return True
+        if method == 'GET' and path == workflow + '/runs':
+            if 'docs-list-403' in self.faults:
+                handler._send(403, {'message': 'Resource not accessible ' + SECRET})
+                return True
+            # Like a real listing that a filter bug could widen: every docs-shaped run, whatever its workflow.
+            listed = sorted(({k: v for k, v in r.items() if k != 'polled'} for r in self.runs.values() if 'polled' in r),
+                            key=lambda r: r['id'], reverse=True)
+            handler._send(200, {'total_count': len(listed), 'workflow_runs': listed})
+            return True
+        return False
+
+    def handle_site(self, handler):
+        """The real page's shape: the logo link and the GitHub link carry `Daana CLI ...` labels too."""
+        version = self.site_versions.pop(0) if len(self.site_versions) > 1 else self.site_versions[0]
+        attribute = '' if self.site_legacy else f' data-daana-version="{version}"'
+        badge = '' if version is None else (f'<span class="rounded-sm" title="Version: {version}"'
+                                            f' aria-label="Daana CLI {version}"{attribute}>{version}</span>')
+        page = self.site_page if self.site_page is not None else (
+            '<html><body><header><a href="/" aria-label="Daana CLI docs home"><svg></svg></a>'
+            f'{badge}<a href="https://github.com/daana-code" aria-label="Daana CLI on GitHub"></a></header>'
+            f'<nav><a href="/" aria-label="Daana CLI docs home"></a></nav>{badge}</body></html>')
+        return handler._send(200, raw=page.encode(), headers={'Content-Type': 'text/html; charset=utf-8'})
+
     def handle_source(self, handler, method, path):
         if 'source-403' in self.faults:
             return handler._send(403, {'message': 'Resource not accessible ' + SECRET})
@@ -215,7 +275,15 @@ class FakeGitHub:
             if parts[1:] == ['artifacts']:
                 listed = self.run_artifacts.get(run, [])
                 return handler._send(200, {'total_count': len(listed), 'artifacts': listed})
-            return handler._send(200, self.runs[run])
+            found = self.runs[run]
+            if 'docs-run-gone' in self.faults and 'polled' in found and run > 7999:
+                return handler._send(404, {'message': 'Not Found'})
+            if 'polled' in found and found['status'] != 'completed':
+                found['polled'] += 1
+                found['status'] = 'in_progress'
+                if found['polled'] >= self.docs_polls and 'docs-never-completes' not in self.faults:
+                    found.update(status='completed', conclusion=self.docs_conclusion)
+            return handler._send(200, {k: v for k, v in found.items() if k != 'polled'})
         zips = f'/repos/{SOURCE}/actions/artifacts/'
         if method == 'GET' and path.startswith(zips) and path.endswith('/zip'):
             artifact = int(path[len(zips):].split('/')[0])
@@ -229,6 +297,14 @@ class FakeGitHub:
 
     def handle(self, handler, method, url, body):
         path = url.path
+        if path.startswith('/site/'):
+            return self.handle_site(handler)
+        if path.startswith(f'/repos/{SOURCE}/actions/workflows/'):
+            if 'docs-api-500' in self.faults:
+                return handler._send(500, raw=('<html>' + SECRET + '</html>').encode())
+            if not self.handle_docs(handler, method, path, body):
+                handler._send(404, {'message': f'no fake route {method} {path}'})
+            return None
         if path.startswith(f'/repos/{SOURCE}/'):
             return self.handle_source(handler, method, path)
         prefix = f'/repos/{REPO}/releases'
@@ -335,7 +411,7 @@ class FakeGitHub:
 def call(module, argv, fake, env=None):
     out, err = io.StringIO(), io.StringIO()
     base = {'GITHUB_REF': 'refs/heads/main', 'PUBLISH_TOKEN': 'fake-token', 'PREFLIGHT_TOKEN': 'fake-token',
-            'READER_TOKEN': 'reader-token', 'RELEASE_REQUIRED_REVIEWER': 'peiman'}
+            'READER_TOKEN': 'reader-token', 'RELEASE_REQUIRED_REVIEWER': 'peiman', 'DOCS_TOKEN': 'docs-token'}
     with redirect_stdout(out), redirect_stderr(err):
         status = module.main([argv[0], '--api', fake.base, *argv[1:]], env={**base, **(env or {})})
     return status, out.getvalue(), err.getvalue()
@@ -753,6 +829,7 @@ class PublishTests(Case):
         self.assertIn('Real notes.', create['body'])
         receipt = self.receipt()
         self.assertEqual((receipt['tag'], receipt['published'], receipt['prepare_run_id']), (TAG, True, RUN))
+        self.assertEqual(receipt['tag_commit'], 'c' * 40, 'the candidate commit, which the docs run must build')
         self.assertEqual(len(receipt['assets']), 5)
         self.assertTrue(any(p.startswith('/s3/asset/') for _, p, _, _ in self.fake.requests))
         # Never the record or the body as an asset.
@@ -946,6 +1023,211 @@ class PublishTests(Case):
         self.assertEqual(self.fake.writes(), [])
 
 
+class DocsTests(Case):
+    """After a confirmed publish: dispatch the source repository's docs deploy, wait for it and check the live site."""
+
+    def setUp(self):
+        super().setUp()
+        for name, value in (('DOCS_FIND_SECONDS', 1.5), ('DOCS_WAIT_SECONDS', 1.5), ('DOCS_LIVE_SECONDS', 1.5), ('DOCS_POLL_SECONDS', 0.02)):
+            self.addCleanup(setattr, self.module, name, getattr(self.module, name))
+            setattr(self.module, name, value)
+        self.write_receipt()
+
+    def fresh(self):
+        """A new fake per case: two dispatches at one tag within seconds are ambiguous, by design."""
+        self.fake.close()
+        self.fake = FakeGitHub()
+        (self.root / 'summary.md').unlink(missing_ok=True)
+
+    def write_receipt(self, **change):
+        receipt = {'schema_version': 1, 'repository': REPO, 'tag': TAG, 'release_tag': TAG, 'candidate_tag': TAG, 'mode': 'publish',
+                   'prepare_run_id': RUN, 'tag_run_id': TAG_RUN, 'tag_commit': 'c' * 40, 'release_id': 101, 'state': 'published', 'published': True,
+                   'assets': [], 'html_url': f'https://example.invalid/{TAG}'}
+        receipt.update(change)
+        (self.root / 'receipt.json').write_text(json.dumps(receipt))
+
+    def docs(self, tag=TAG, mode='publish', env=None):
+        summary = self.root / 'summary.md'
+        return self.run_cmd('docs', '--site', self.fake.base + '/site/', '--tag', tag, '--mode', mode,
+                            '--receipt', str(self.root / 'receipt.json'), env={'GITHUB_STEP_SUMMARY': str(summary), **(env or {})})
+
+    def summary(self):
+        path = self.root / 'summary.md'
+        return path.read_text() if path.exists() else ''
+
+    def manual(self, ref=TAG, version=TAG):
+        return f'gh workflow run deploy-docs.yml -R {SOURCE} --ref {ref} -f version_override={version} -f runner=hosted'
+
+    def public_requests(self):
+        return [(m, p) for m, p, _, _ in self.fake.requests if p.startswith(f'/repos/{REPO}/') or '/uploads/' in p]
+
+    def test_publish_dispatches_the_deploy_at_the_tag_with_exactly_the_tag_and_hosted(self):
+        status, out, err = self.docs()
+        self.assertEqual(status, 0, err)
+        self.assertEqual(self.fake.docs_dispatches, [{'ref': TAG, 'inputs': {'version_override': TAG, 'runner': 'hosted'}}])
+        [dispatch] = [h for m, p, h, _ in self.fake.requests if m == 'POST']
+        self.assertEqual(dispatch.get('Authorization'), 'Bearer docs-token', 'the docs token, and only for the source repository')
+        self.assertEqual(self.public_requests(), [], 'the published release is never touched')
+        run_id = self.fake.docs_next
+        docs = self.receipt()['docs']
+        self.assertEqual(docs, {'state': 'live', 'repository': SOURCE, 'workflow': 'deploy-docs.yml', 'ref': TAG, 'version': TAG,
+                                'runner': 'hosted', 'run_id': run_id, 'run_url': f'https://github.com/{SOURCE}/actions/runs/{run_id}',
+                                'observed_version': TAG})
+        self.assertEqual((self.receipt()['state'], self.receipt()['published']), ('published', True), 'the publish record stays')
+        self.assertIn(f'https://github.com/{SOURCE}/actions/runs/{run_id}', self.summary())
+        self.assertIn(f'`{TAG}`', self.summary())
+        self.assertEqual(out.strip(), f'DOCS {TAG} deploy run {run_id} succeeded; the docs site shows {TAG}')
+
+    def test_a_final_release_deploys_its_candidates_source_stamped_with_the_final_version(self):
+        self.write_receipt(tag='v1.0.0', release_tag='v1.0.0', candidate_tag=TAG)
+        self.fake.site_versions = ['v1.0.0']
+        status, out, err = self.docs(tag='v1.0.0')
+        self.assertEqual(status, 0, err)
+        self.assertEqual(self.fake.docs_dispatches, [{'ref': TAG, 'inputs': {'version_override': 'v1.0.0', 'runner': 'hosted'}}])
+
+    def test_rehearse_never_dispatches(self):
+        cases = [
+            ('rehearse mode', {}, TAG, 'rehearse', 'DOCS_REHEARSE'),
+            ('a rehearse receipt', {'mode': 'rehearse', 'published': False, 'state': 'draft-verified'}, TAG, 'publish', 'DOCS_NOT_PUBLISHED'),
+            ('a rehearse draft under the rehearsal tag', {'mode': 'rehearse', 'tag': f'{TAG}-rehearsal.{RUN}', 'published': False}, TAG, 'publish', 'DOCS_NOT_PUBLISHED'),
+            ('an unknown outcome', {'state': 'unknown', 'published': None}, TAG, 'publish', 'DOCS_NOT_PUBLISHED'),
+            ('a mismatched publish', {'state': 'published-mismatch'}, TAG, 'publish', 'DOCS_NOT_PUBLISHED'),
+            ('another tag', {'tag': 'v1.0.0-rc.2', 'release_tag': 'v1.0.0-rc.2', 'candidate_tag': 'v1.0.0-rc.2'}, TAG, 'publish', 'DOCS_NOT_PUBLISHED'),
+            ('a rehearsal candidate', {'candidate_tag': 'v1.0.0-rc.1-rehearsal.1'}, TAG, 'publish', 'DOCS_NOT_PUBLISHED'),
+            ('another release tag', {'release_tag': 'v1.0.0-rc.2'}, TAG, 'publish', 'DOCS_NOT_PUBLISHED'),
+            ('published false', {'published': False}, TAG, 'publish', 'DOCS_NOT_PUBLISHED'),
+            ('a candidate the tag does not ship', {'tag': 'v1.0.0', 'release_tag': 'v1.0.0', 'candidate_tag': 'v1.1.0-rc.1'}, 'v1.0.0', 'publish',
+             'DOCS_NOT_PUBLISHED'),
+            ('no candidate commit', {'tag_commit': None}, TAG, 'publish', 'DOCS_NOT_PUBLISHED'),
+            ('a rehearsal tag', {'tag': 'v1.0.0-rc.1-rehearsal.1', 'release_tag': 'v1.0.0-rc.1-rehearsal.1', 'candidate_tag': 'v1.0.0-rc.1-rehearsal.1'},
+             'v1.0.0-rc.1-rehearsal.1', 'publish', 'DOCS_REHEARSE'),
+        ]
+        for name, change, tag, mode, code in cases:
+            with self.subTest(name):
+                self.fake.requests.clear()
+                self.write_receipt(**change)
+                self.assertCode(self.docs(tag=tag, mode=mode), code)
+                self.assertEqual(self.fake.requests, [], 'nothing is dispatched or read')
+        (self.root / 'receipt.json').unlink()
+        self.assertCode(self.docs(), 'DOCS_NOT_PUBLISHED')
+        self.assertEqual(self.fake.docs_dispatches, [])
+
+    def test_run_discovery_takes_only_the_run_this_dispatch_created(self):
+        status, out, err = self.docs()
+        self.assertEqual(status, 0, err)
+        self.assertEqual(self.receipt()['docs']['run_id'], self.fake.docs_next, 'not the older dispatch, the push run or another ref')
+        for fault, code in (('docs-no-run', 'DOCS_RUN_NOT_FOUND'), ('docs-two-runs', 'DOCS_RUN_AMBIGUOUS'), ('docs-list-403', 'DOCS_API_FAILED')):
+            with self.subTest(fault):
+                self.fresh()
+                self.fake.faults = {fault}
+                self.write_receipt()
+                started = time.monotonic()
+                self.assertCode(self.docs(), code)
+                self.assertLess(time.monotonic() - started, self.module.DOCS_FIND_SECONDS + 1, 'the search is bounded')
+                docs = self.receipt()['docs']
+                self.assertEqual((docs['state'], docs['refused']), ('failed', code))
+                self.assertNotIn('run_id', docs)
+
+    def test_the_run_must_build_the_candidates_commit_and_must_not_vanish(self):
+        for fault, code in (('docs-other-commit', 'DOCS_RUN_OTHER_COMMIT'), ('docs-run-gone', 'DOCS_RUN_NOT_FOUND')):
+            with self.subTest(fault):
+                self.fresh()
+                self.fake.faults = {fault}
+                self.write_receipt()
+                started = time.monotonic()
+                self.assertCode(self.docs(), code)
+                self.assertLess(time.monotonic() - started, 1, 'refused at once, not after the wait')
+                self.assertEqual(self.receipt()['docs']['run_id'], self.fake.docs_next)
+
+    def test_the_wait_for_the_deploy_is_bounded(self):
+        self.fake.faults = {'docs-never-completes'}
+        started = time.monotonic()
+        status, out, err = self.docs()
+        self.assertCode((status, out, err), 'DOCS_DEPLOY_TIMEOUT')
+        self.assertLess(time.monotonic() - started, self.module.DOCS_WAIT_SECONDS + self.module.DOCS_FIND_SECONDS + 1)
+        self.assertIn(f'run={self.fake.docs_next}', err)
+        self.assertEqual(self.receipt()['docs']['run_id'], self.fake.docs_next, 'the run found is recorded before the wait')
+
+    def test_a_failed_deploy_fails_the_job_naming_the_manual_re_dispatch(self):
+        for conclusion in ('failure', 'cancelled', 'timed_out', None, 'private-word'):
+            with self.subTest(conclusion=conclusion):
+                self.fresh()
+                self.fake.docs_conclusion = conclusion
+                self.write_receipt()
+                status, out, err = self.docs()
+                self.assertCode((status, out, err), 'DOCS_DEPLOY_FAILED')
+                self.assertIn(f'conclusion={conclusion if conclusion in ("failure", "cancelled", "timed_out") else "other"}', err,
+                              'the conclusion prints only as a fixed word')
+                self.assertIn('Re-dispatch the docs deploy by hand: ' + self.manual(), err)
+                self.assertIn(self.manual(), self.summary())
+                self.assertEqual(self.receipt()['docs']['state'], 'failed')
+                self.assertEqual(self.public_requests(), [], 'the published release is left alone')
+        # A final release names its candidate as the ref.
+        self.fresh()
+        self.fake.docs_conclusion = 'failure'
+        self.write_receipt(tag='v1.0.0', release_tag='v1.0.0', candidate_tag=TAG)
+        self.assertIn(self.manual(ref=TAG, version='v1.0.0'), self.docs(tag='v1.0.0')[2])
+
+    def test_a_failed_dispatch_or_api_prints_only_codes_and_the_manual_command(self):
+        for fault in ('docs-dispatch-500', 'docs-api-500'):
+            with self.subTest(fault):
+                self.fresh()
+                self.fake.faults = {fault}
+                self.write_receipt()
+                status, out, err = self.docs()
+                self.assertCode((status, out, err), 'DOCS_API_FAILED')
+                self.assertNotIn(SECRET, out + err + self.summary())
+                self.assertIn(self.manual(), err)
+
+    def test_the_live_check_retries_until_the_site_shows_the_tag(self):
+        self.fake.site_versions = ['v0.9.0', None, 'v0.9.0', TAG]
+        status, out, err = self.docs()
+        self.assertEqual(status, 0, err)
+        site = [h for m, p, h, _ in self.fake.requests if p.startswith('/site/')]
+        self.assertEqual(len(site), 4)
+        self.assertTrue(all('Authorization' not in h for h in site), 'the site is read without any credential')
+
+    def test_the_live_check_reads_only_the_badge_attribute_whatever_other_labels_the_page_has(self):
+        # The fake site serves the real page's shape: the logo and GitHub links' labels next to the badge.
+        status, out, err = self.docs()
+        self.assertEqual(status, 0, err)
+        self.assertEqual(self.module.page_versions(f'<a aria-label="Daana CLI docs home"></a><span data-daana-version="{TAG}"'
+                                                   f' aria-label="Daana CLI {TAG}"></span><a aria-label="Daana CLI on GitHub"></a>'
+                                                   + '<a aria-label="Daana CLI docs home"></a>' * 5), {TAG})
+
+    def test_a_site_from_before_the_attribute_is_read_from_its_version_shaped_badge_label(self):
+        self.fake.site_legacy = True
+        status, out, err = self.docs()
+        self.assertEqual(status, 0, err)
+        self.assertEqual(self.receipt()['docs']['observed_version'], TAG)
+        # Once any badge carries the attribute, the labels no longer count.
+        self.assertEqual(self.module.page_versions(f'<span data-daana-version="v0.9.0"></span><span aria-label="Daana CLI {TAG}"></span>'),
+                         {'v0.9.0'})
+
+    def test_the_live_check_refuses_a_site_that_never_shows_the_tag(self):
+        cases = (('an old version', ['v0.9.0'], None, 'seen=v0.9.0'), ('no badge', [None], None, 'seen=none'),
+                 ('two versions', [TAG], f'<span data-daana-version="{TAG}"></span><span data-daana-version="v0.9.0"></span>', 'seen=several'),
+                 ('a version that is not release-shaped', [TAG], f'<span data-daana-version="{TAG}+gabc1234"></span>', 'seen=none'),
+                 ('only the other labels', [TAG], '<a aria-label="Daana CLI docs home"></a><a aria-label="Daana CLI on GitHub"></a>', 'seen=none'))
+        for name, versions, page, seen in cases:
+            with self.subTest(name):
+                self.fresh()
+                self.fake.site_versions, self.fake.site_page = versions, page
+                self.write_receipt()
+                started = time.monotonic()
+                status, out, err = self.docs()
+                self.assertCode((status, out, err), 'DOCS_LIVE_MISMATCH')
+                self.assertIn(seen, err)
+                self.assertLess(time.monotonic() - started, self.module.DOCS_LIVE_SECONDS + 2, 'the live check is bounded')
+                self.assertIn(self.manual(), err)
+                self.assertEqual(self.receipt()['docs']['state'], 'failed')
+
+    def test_only_a_dispatch_from_main_may_deploy_the_docs_and_a_token_is_required(self):
+        self.assertCode(self.docs(env={'GITHUB_REF': 'refs/heads/feature'}), 'NOT_MAIN')
+        self.assertCode(self.docs(env={'DOCS_TOKEN': ''}), 'TOKEN_MISSING')
+        self.assertEqual(self.fake.requests, [])
+
+
 class RecoverTests(Case):
     def recover(self, release_id, tag=TAG, delete=True):
         return self.run_cmd('recover', '--repo', REPO, '--release-id', str(release_id), '--tag', tag,
@@ -1120,6 +1402,40 @@ MUTATIONS = [
     ('admin bypass', "if environment.get('can_admins_bypass') is not False:", 'if False:', 'PreflightTests.test_each_missing_protection_is_refused'),
     ('main-only branch policy', "if listed.get('branch_policies') is None or names != [('main', 'branch')]:", 'if False:',
      'PreflightTests.test_each_missing_protection_is_refused'),
+    ('docs: rehearse never dispatches', "if args.mode != 'publish' or is_rehearsal(args.tag):", 'if False:',
+     'DocsTests.test_rehearse_never_dispatches'),
+    ('docs: only after a confirmed publish of this tag', 'if not docs_receipt_ok(receipt, args.tag):', 'if False:',
+     'DocsTests.test_rehearse_never_dispatches'),
+    ('docs: the run was created after the dispatch', 'and created >= since', 'and True',
+     'DocsTests.test_run_discovery_takes_only_the_run_this_dispatch_created'),
+    ('docs: the run is a dispatch of the workflow at the ref', "and run.get('event') == 'workflow_dispatch' and run.get('head_branch') == ref", 'and True',
+     'DocsTests.test_run_discovery_takes_only_the_run_this_dispatch_created'),
+    ('docs: one run only', 'if len(found) > 1:', 'if False:', 'DocsTests.test_run_discovery_takes_only_the_run_this_dispatch_created'),
+    ('docs: the deploy must succeed', "if run.get('conclusion') != 'success':", 'if False:',
+     'DocsTests.test_a_failed_deploy_fails_the_job_naming_the_manual_re_dispatch'),
+    ('docs: the site must show exactly the tag', 'if seen == {tag}:', 'if seen:', 'DocsTests.test_the_live_check_refuses_a_site_that_never_shows_the_tag'),
+    ('docs: only version-shaped values count', 'return {value for value in values if DOCS_VERSION_SHAPE.fullmatch(value)}', 'return set(values)',
+     'DocsTests.test_the_live_check_refuses_a_site_that_never_shows_the_tag'),
+    ('docs: the badge attribute, not any label', 'values = DOCS_VERSION_ATTRIBUTE.findall(page)',
+     'values = re.findall(r\'aria-label="Daana CLI ([^"<>]{1,64})"\', page)',
+     'DocsTests.test_a_site_from_before_the_attribute_is_read_from_its_version_shaped_badge_label'),
+    ('docs: the legacy label only without any attribute', 'if not values:', 'if True:',
+     'DocsTests.test_a_site_from_before_the_attribute_is_read_from_its_version_shaped_badge_label'),
+    ('docs: the run builds the candidate commit', "if run.get('head_sha') != receipt['tag_commit']:", 'if False:',
+     'DocsTests.test_the_run_must_build_the_candidates_commit_and_must_not_vanish'),
+    ('docs: a vanished run refuses at once', 'if run is None:  # a GET 404: the run is gone', 'if False:',
+     'DocsTests.test_the_run_must_build_the_candidates_commit_and_must_not_vanish'),
+    ('docs: the workflow path', "if (is_count(run.get('id')) and run.get('path') == path", "if (is_count(run.get('id'))",
+     'DocsTests.test_run_discovery_takes_only_the_run_this_dispatch_created'),
+    ('docs: the conclusion is a fixed word', "conclusion=conclusion if conclusion in DOCS_CONCLUSIONS else 'other'", 'conclusion=str(conclusion)',
+     'DocsTests.test_a_failed_deploy_fails_the_job_naming_the_manual_re_dispatch'),
+    ('docs: the receipt names this release tag', "and receipt.get('tag') == tag and receipt.get('release_tag') == tag", "and receipt.get('tag') == tag",
+     'DocsTests.test_rehearse_never_dispatches'),
+    ('docs: the receipt says published', "receipt.get('published') is True", 'True', 'DocsTests.test_rehearse_never_dispatches'),
+    ('docs: the tag ships the candidate', 'and not is_rehearsal(candidate) and ships_candidate(tag, candidate)', 'and not is_rehearsal(candidate)',
+     'DocsTests.test_rehearse_never_dispatches'),
+    ('docs: the dispatch inputs', "'inputs': {DOCS_DEPLOY['version_input']: tag, DOCS_DEPLOY['runner_input']: DOCS_DEPLOY['runner']}",
+     "'inputs': {DOCS_DEPLOY['version_input']: tag}", 'DocsTests.test_publish_dispatches_the_deploy_at_the_tag_with_exactly_the_tag_and_hosted'),
 ]
 
 
