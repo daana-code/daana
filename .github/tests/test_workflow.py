@@ -21,6 +21,8 @@ WORKFLOW_CREDENTIALS = {
     'RELEASE_READER_PRIVATE_KEY',
     'RELEASE_APP_ID',
     'RELEASE_APP_PRIVATE_KEY',
+    'DOCS_DISPATCH_APP_ID',
+    'DOCS_DISPATCH_APP_PRIVATE_KEY',
 }
 READER_TOKEN_SCOPE = {
     'app-id': '${{ vars.RELEASE_READER_APP_ID }}',
@@ -36,6 +38,14 @@ WRITER_TOKEN_SCOPE = {
     'repositories': 'daana',
     'permission-contents': 'write',
 }
+DOCS_TOKEN_SCOPE = {
+    'app-id': '${{ vars.DOCS_DISPATCH_APP_ID }}',
+    'private-key': '${{ secrets.DOCS_DISPATCH_APP_PRIVATE_KEY }}',
+    'owner': 'daana-code',
+    'repositories': 'daana-cli',
+    'permission-actions': 'write',
+}
+PUBLISH_ONLY = "inputs.mode == 'publish'"
 REQUIRED_CHECK = 'Publisher tests'
 # The same reviewed pins as the source repository's release workflows.
 PINS = {
@@ -104,8 +114,8 @@ def guard_shape(doc):
 
 def guard_order(doc):
     ids = [s.get('id') for s in doc['jobs']['publish']['steps']]
-    assert ids == ['checkout', 'preflight', 'reader-token', 'fetch', 'app-token', 'publish', 'receipt'], \
-        'preflight, then the reader, then fetch and verify, then the publisher token right before publishing: ' + str(ids)
+    assert ids == ['checkout', 'preflight', 'reader-token', 'fetch', 'app-token', 'publish', 'docs-token', 'docs', 'receipt'], \
+        'preflight, then the reader, then fetch and verify, then the publisher token right before publishing, then the docs: ' + str(ids)
 
 
 def guard_credentials(doc):
@@ -113,7 +123,7 @@ def guard_credentials(doc):
     for where, text in strings(doc):
         for name in re.findall(r'(?:secrets|vars)\.([A-Z_]+)', text):
             found.setdefault(name, []).append('.'.join(map(str, where)))
-    reader, writer = index(doc, 'reader-token'), index(doc, 'app-token')
+    reader, writer, docs = index(doc, 'reader-token'), index(doc, 'app-token'), index(doc, 'docs-token')
     preflight = index(doc, 'preflight')
     assert found == {
         'RELEASE_REQUIRED_REVIEWER': [f'jobs.publish.steps.{preflight}.env.RELEASE_REQUIRED_REVIEWER'],
@@ -121,18 +131,23 @@ def guard_credentials(doc):
         'RELEASE_READER_PRIVATE_KEY': [f'jobs.publish.steps.{reader}.with.private-key'],
         'RELEASE_APP_ID': [f'jobs.publish.steps.{writer}.with.app-id'],
         'RELEASE_APP_PRIVATE_KEY': [f'jobs.publish.steps.{writer}.with.private-key'],
+        'DOCS_DISPATCH_APP_ID': [f'jobs.publish.steps.{docs}.with.app-id'],
+        'DOCS_DISPATCH_APP_PRIVATE_KEY': [f'jobs.publish.steps.{docs}.with.private-key'],
     }, 'each key and ID is read only by its own token step: ' + str(found)
     assert set(found) == WORKFLOW_CREDENTIALS, 'the workflow reads exactly the publisher credential names'
-    assert step(doc, 'reader-token')['uses'] == APP_TOKEN and step(doc, 'app-token')['uses'] == APP_TOKEN, \
+    assert all(step(doc, name)['uses'] == APP_TOKEN for name in ('reader-token', 'app-token', 'docs-token')), \
         'create-github-app-token pinned by SHA'
     assert step(doc, 'reader-token')['with'] == READER_TOKEN_SCOPE, \
         'the reader token: the source repository only, Actions read only'
     assert step(doc, 'app-token')['with'] == WRITER_TOKEN_SCOPE, \
         'the publisher token: this repository only, Contents write only'
+    assert step(doc, 'docs-token')['with'] == DOCS_TOKEN_SCOPE, \
+        'the docs token: the source repository only, Actions write only'
     uses = {name: ['.'.join(map(str, w)) for w, t in strings(doc) if f'steps.{name}.outputs.token' in t]
-            for name in ('reader-token', 'app-token')}
+            for name in ('reader-token', 'app-token', 'docs-token')}
     assert uses == {'reader-token': [f'jobs.publish.steps.{index(doc, "fetch")}.env.READER_TOKEN'],
-                    'app-token': [f'jobs.publish.steps.{index(doc, "publish")}.env.PUBLISH_TOKEN']}, \
+                    'app-token': [f'jobs.publish.steps.{index(doc, "publish")}.env.PUBLISH_TOKEN'],
+                    'docs-token': [f'jobs.publish.steps.{index(doc, "docs")}.env.DOCS_TOKEN']}, \
         'each minted token reaches only its own step: ' + str(uses)
     github_token = ['.'.join(map(str, w)) for w, t in strings(doc) if 'github.token' in t or 'secrets.GITHUB_TOKEN' in t]
     assert github_token == [f'jobs.publish.steps.{preflight}.env.PREFLIGHT_TOKEN'], 'GITHUB_TOKEN is used only to read the environment'
@@ -154,6 +169,11 @@ def guard_commands(doc):
         env = dict(step(doc, step_id)['env'])
         env.pop('READER_TOKEN' if step_id == 'fetch' else 'PUBLISH_TOKEN')
         assert env == inputs, step_id + ' gets the same inputs'
+    assert step(doc, 'docs')['run'] == ('python3 -I -B .github/scripts/publish.py docs --tag "$RELEASE_TAG" --mode "$MODE" '
+                                        '--receipt "$RUNNER_TEMP/publish-receipt.json"'), 'deploy the docs of this release'
+    env = dict(step(doc, 'docs')['env'])
+    env.pop('DOCS_TOKEN')
+    assert env == {'RELEASE_TAG': inputs['RELEASE_TAG'], 'MODE': inputs['MODE']}, 'docs gets the tag and the mode'
     checkout = step(doc, 'checkout')
     assert checkout['with'] == {'persist-credentials': False}, 'checkout keeps no credential'
 
@@ -163,6 +183,16 @@ def guard_receipt(doc):
     assert keep.get('if') == 'always()', 'the receipt is kept even when the job fails'
     assert keep['with'] == {'name': 'release-publish-receipt', 'path': '${{ runner.temp }}/publish-receipt.json',
                             'retention-days': 90, 'if-no-files-found': 'ignore'}, 'the receipt, kept 90 days'
+
+
+def guard_docs(doc):
+    for step_id in ('docs-token', 'docs'):
+        assert step(doc, step_id).get('if') == PUBLISH_ONLY, \
+            f'{step_id}: mode=publish only, and only after every earlier step succeeded'
+    job = doc['jobs']['publish']
+    assert job.get('environment') == 'release', 'the docs App ID and key are release environment settings'
+    assert step(doc, 'docs').get('timeout-minutes') == 30, 'the docs step is bounded: find, a 20-minute wait, a 5-minute live check'
+    assert job.get('timeout-minutes') >= 60, 'the job leaves room for the publish and the docs step'
 
 
 def guard_pinned(doc, raw):
@@ -200,7 +230,7 @@ def guard_tests_workflow(doc):
             assert line.strip().endswith('pip install --require-hashes -r .github/tests/requirements.txt'), 'pip installs only hashed requirements'
 
 
-GUARDS = [guard_shape, guard_order, guard_credentials, guard_commands, guard_receipt]
+GUARDS = [guard_shape, guard_order, guard_credentials, guard_commands, guard_receipt, guard_docs]
 
 
 def find(doc, step_id):
@@ -234,6 +264,19 @@ MUTATIONS = [
     (guard_commands, lambda d: find(d, 'publish')['env'].update(MODE='publish'), 'publish gets the same inputs'),
     (guard_commands, lambda d: find(d, 'checkout')['with'].update({'persist-credentials': True}), 'checkout keeps no credential'),
     (guard_receipt, lambda d: find(d, 'receipt').pop('if'), 'the receipt is kept even when the job fails'),
+    (guard_order, lambda d: d['jobs']['publish']['steps'].insert(5, d['jobs']['publish']['steps'].pop(7)), 'then the docs'),
+    (guard_docs, lambda d: find(d, 'docs').pop('if'), 'docs: mode=publish only'),
+    (guard_docs, lambda d: find(d, 'docs').update({'if': "always() && inputs.mode == 'publish'"}), 'docs: mode=publish only'),
+    (guard_docs, lambda d: find(d, 'docs-token').update({'if': 'always()'}), 'docs-token: mode=publish only'),
+    (guard_docs, lambda d: find(d, 'docs').pop('timeout-minutes'), 'the docs step is bounded'),
+    (guard_docs, lambda d: d['jobs']['publish'].update({'timeout-minutes': 30}), 'the job leaves room'),
+    (guard_credentials, lambda d: find(d, 'docs-token')['with'].update(repositories='daana-cli,daana'), 'the docs token: the source repository only'),
+    (guard_credentials, lambda d: find(d, 'docs-token')['with'].update({'permission-contents': 'write'}), 'the docs token: the source repository only'),
+    (guard_credentials, lambda d: find(d, 'docs-token').update(uses='actions/create-github-app-token@v2'), 'pinned by SHA'),
+    (guard_credentials, lambda d: find(d, 'publish')['env'].update(DOCS_TOKEN='${{ steps.docs-token.outputs.token }}'), 'each minted token reaches only its own step'),
+    (guard_credentials, lambda d: find(d, 'docs')['env'].update(KEY='${{ secrets.DOCS_DISPATCH_APP_PRIVATE_KEY }}'), 'each key and ID is read only by its own token step'),
+    (guard_commands, lambda d: find(d, 'docs').update(run=find(d, 'docs')['run'].replace('--mode "$MODE"', '--mode publish')), 'deploy the docs of this release'),
+    (guard_commands, lambda d: find(d, 'docs')['env'].update(MODE='publish'), 'docs gets the tag and the mode'),
 ]
 
 

@@ -32,15 +32,29 @@ Nothing is built here. Standard library only.
       the receipt `unknown`. mode=rehearse stops at the verified draft.
       Token: PUBLISH_TOKEN (the Release Publisher App, Contents: write here).
 
+  docs --tag TAG --mode publish --receipt FILE
+      Deploy the docs of the release just published. Refuse unless mode is
+      publish and the receipt records a confirmed publish of TAG. Dispatch the
+      source repository's docs deploy (DOCS_DEPLOY) at the candidate tag (the
+      source the bytes were built from) with the version TAG and the hosted
+      runner, find the one run that dispatch created, wait for it to succeed,
+      then read the version the docs site's badge shows, with no credential,
+      until it is TAG. Each step is recorded under `docs` in the receipt and in
+      the job summary. It never touches the release; a failure names the
+      manual re-dispatch. Token: DOCS_TOKEN (the Docs Dispatch App, Actions:
+      write on the source repository only).
+
   recover --repo OWNER/NAME --release-id N --tag TAG [--delete-draft]
       Read a release by ID. --delete-draft deletes it only while it is still a
       draft of TAG; a published release is never deleted. Token: PUBLISH_TOKEN.
 
-preflight, fetch and publish refuse unless GITHUB_REF is refs/heads/main.
+preflight, fetch, publish and docs refuse unless GITHUB_REF is refs/heads/main.
 
 Actions logs of this repository are public. Output is limited to fixed codes,
 asset names, sizes, SHA-256s, numeric IDs and tags: no API response bodies,
-URLs or exception text. Exit 0 passes; exit 1 prints `REFUSED <command>: <CODE>`.
+URLs or exception text. The one exception, from docs: its deploy run's URL and
+the manual re-dispatch command, both built from DOCS_DEPLOY, a checked tag and
+the run ID. Exit 0 passes; exit 1 prints `REFUSED <command>: <CODE>`.
 """
 import argparse
 import fnmatch
@@ -54,6 +68,7 @@ import re
 import stat
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -87,6 +102,29 @@ CHECKSUM_LINE = re.compile(r'([0-9a-f]{64})  (\S+)')
 ENTRY = re.compile(r'(?:assets/)?[A-Za-z0-9][A-Za-z0-9._+-]{0,199}')
 # A detail value that may appear in a public log: an ID, a tag, an asset name or a digest.
 SAFE = re.compile(r'[A-Za-z0-9._+-]{1,128}')
+
+# The docs deploy contract with the source repository, in one place: its
+# workflow file, the two inputs it is dispatched with and the runner value that
+# needs no self-hosted runner. daana-cli's policy tests pin the same names.
+# `site` is the public page whose version badge shows what is live.
+DOCS_DEPLOY = {
+    'repo': SOURCE_REPO,
+    'workflow': 'deploy-docs.yml',
+    'version_input': 'version_override',
+    'runner_input': 'runner',
+    'runner': 'hosted',
+    'site': 'https://docs.daana.dev/',
+}
+# The badge as the site renders it: aria-label="Daana CLI <version>".
+DOCS_BADGE = re.compile(r'aria-label="Daana CLI ([^"<>]{1,64})"')
+# Bounds, in seconds; tests shorten them. The live check allows for CDN propagation.
+DOCS_FIND_SECONDS = 120
+DOCS_WAIT_SECONDS = 20 * 60
+DOCS_LIVE_SECONDS = 5 * 60
+DOCS_POLL_SECONDS = 10
+# How far the runner's clock may be ahead of GitHub's when matching the new run.
+DOCS_CLOCK_SKEW = timedelta(seconds=10)
+DOCS_PAGE_BYTES = 5 * 1024 ** 2
 
 # Bytes a bundle may hold, compressed or not; tests shorten it.
 MAX_BUNDLE_BYTES = 4 * 1024 ** 3
@@ -625,6 +663,162 @@ def recover(args, token):
     return f'{state} {args.repo} {args.tag} release {args.release_id}'
 
 
+# --- after a confirmed publish: the source repository's docs deploy ---
+
+def docs_manual(ref, tag):
+    """The exact hand re-dispatch; ref and tag are already checked against TAG."""
+    return (f"gh workflow run {DOCS_DEPLOY['workflow']} -R {DOCS_DEPLOY['repo']} --ref {ref} "
+            f"-f {DOCS_DEPLOY['version_input']}={tag} -f {DOCS_DEPLOY['runner_input']}={DOCS_DEPLOY['runner']}")
+
+
+def docs_receipt_ok(receipt, tag):
+    """The publish step confirmed TAG is public, in publish mode, from a real candidate."""
+    if not isinstance(receipt, dict):
+        return False
+    candidate = str(receipt.get('candidate_tag'))
+    return (receipt.get('mode') == 'publish' and receipt.get('state') == 'published' and receipt.get('published') is True
+            and receipt.get('tag') == tag and receipt.get('release_tag') == tag
+            and TAG.fullmatch(candidate) is not None and not is_rehearsal(candidate) and ships_candidate(tag, candidate))
+
+
+def docs_call(call, *args, **kwargs):
+    try:
+        return call(*args, **kwargs)
+    except ApiError as error:
+        raise Refused('DOCS_API_FAILED', status=error.status or 0) from None
+
+
+def find_docs_run(source, ref, since):
+    """The one workflow_dispatch run of the docs workflow at ref created since the dispatch, within DOCS_FIND_SECONDS."""
+    path = '.github/workflows/' + DOCS_DEPLOY['workflow']
+    deadline = time.monotonic() + DOCS_FIND_SECONDS
+    while True:
+        try:
+            listed = source.request('GET', f"/actions/workflows/{DOCS_DEPLOY['workflow']}/runs?event=workflow_dispatch&per_page=30")
+        except ApiError:
+            listed = None
+        runs = listed.get('workflow_runs') if isinstance(listed, dict) else None
+        found = []
+        for run in runs if isinstance(runs, list) else []:
+            if not isinstance(run, dict):
+                continue
+            created = parse_time(run.get('created_at'))
+            if (is_count(run.get('id')) and run.get('path') == path
+                    and run.get('event') == 'workflow_dispatch' and run.get('head_branch') == ref
+                    and created is not None
+                    and created >= since):
+                found.append(run)
+        if len(found) > 1:
+            raise Refused('DOCS_RUN_AMBIGUOUS', found=len(found))
+        if found:
+            return found[0]
+        if time.monotonic() >= deadline:
+            raise Refused('DOCS_RUN_NOT_FOUND')
+        time.sleep(DOCS_POLL_SECONDS)
+
+
+def wait_docs_run(source, run_id, ref):
+    """Wait, within DOCS_WAIT_SECONDS, for the run to complete; it must succeed."""
+    deadline = time.monotonic() + DOCS_WAIT_SECONDS
+    while True:
+        try:
+            run = source.request('GET', f'/actions/runs/{run_id}')
+        except ApiError as error:
+            if error.status in (401, 403, 404):
+                raise Refused('DOCS_API_FAILED', status=error.status, run=run_id) from None
+            run = None
+        if isinstance(run, dict) and (run.get('id') != run_id or run.get('head_branch') != ref):
+            raise Refused('DOCS_RUN_CHANGED', run=run_id)
+        if isinstance(run, dict) and run.get('status') == 'completed':
+            if run.get('conclusion') != 'success':
+                raise Refused('DOCS_DEPLOY_FAILED', run=run_id, conclusion=str(run.get('conclusion')))
+            return
+        if time.monotonic() >= deadline:
+            raise Refused('DOCS_DEPLOY_TIMEOUT', run=run_id)
+        time.sleep(DOCS_POLL_SECONDS)
+
+
+def site_versions(site):
+    """Every version the site's badge shows, read with no credential; empty when unreadable."""
+    request = urllib.request.Request(site, headers={'Cache-Control': 'no-cache', 'User-Agent': 'daana-publish-docs-check'})
+    try:
+        with urllib.request.build_opener().open(request, timeout=min(TIMEOUT, 60)) as response:
+            page = response.read(DOCS_PAGE_BYTES).decode('utf-8', 'replace')
+    except (urllib.error.URLError, OSError, http.client.HTTPException, ValueError):
+        return set()
+    return set(DOCS_BADGE.findall(page))
+
+
+def wait_live(site, tag):
+    """Within DOCS_LIVE_SECONDS, the site's badge must show exactly TAG."""
+    deadline = time.monotonic() + DOCS_LIVE_SECONDS
+    while True:
+        seen = site_versions(site)
+        if seen == {tag}:
+            return tag
+        if time.monotonic() >= deadline:
+            raise Refused('DOCS_LIVE_MISMATCH', want=tag,
+                          seen=next(iter(seen)) if len(seen) == 1 else 'several' if seen else 'none')
+        time.sleep(DOCS_POLL_SECONDS)
+
+
+def summarize(path, lines):
+    if not path:
+        return
+    try:
+        with open(path, 'a', encoding='utf-8') as stream:
+            stream.write('\n'.join(lines) + '\n')
+    except OSError:
+        pass
+
+
+def docs(args, token, summary):
+    """Deploy the docs of the release just published, wait for the run and check the live site."""
+    if args.mode != 'publish' or is_rehearsal(args.tag):
+        raise Refused('DOCS_REHEARSE')
+    if not TAG.fullmatch(str(args.tag)):
+        raise Refused('INPUT_INVALID')
+    tag = args.tag
+    try:
+        receipt = json.loads(Path(args.receipt).read_text())
+    except (OSError, ValueError):
+        receipt = None
+    if not docs_receipt_ok(receipt, args.tag):
+        raise Refused('DOCS_NOT_PUBLISHED', tag=tag)
+    if not token:
+        raise Refused('TOKEN_MISSING')
+    ref = receipt['candidate_tag']
+    record = {'state': 'dispatch-requested', 'repository': DOCS_DEPLOY['repo'], 'workflow': DOCS_DEPLOY['workflow'],
+              'ref': ref, 'version': tag, 'runner': DOCS_DEPLOY['runner']}
+    receipt['docs'] = record
+    write_receipt(args.receipt, receipt)
+    source = GitHub(args.api, DOCS_DEPLOY['repo'], token)
+    try:
+        since = now().replace(microsecond=0) - DOCS_CLOCK_SKEW
+        docs_call(source.request, 'POST', f"/actions/workflows/{DOCS_DEPLOY['workflow']}/dispatches", payload={
+            'ref': ref, 'inputs': {DOCS_DEPLOY['version_input']: tag, DOCS_DEPLOY['runner_input']: DOCS_DEPLOY['runner']}})
+        run_id = find_docs_run(source, ref, since)['id']
+        url = f"https://github.com/{DOCS_DEPLOY['repo']}/actions/runs/{run_id}"
+        record.update(state='deploying', run_id=run_id, run_url=url)
+        write_receipt(args.receipt, receipt)
+        wait_docs_run(source, run_id, ref)
+        record.update(state='deployed')
+        write_receipt(args.receipt, receipt)
+        observed = wait_live(args.site, tag)
+    except Refused as refused:
+        refused.manual = 'Re-dispatch the docs deploy by hand: ' + docs_manual(ref, tag)
+        record.update(state='failed', refused=refused.code)
+        write_receipt(args.receipt, receipt)
+        summarize(summary, ['### Docs deploy failed', '', f'`{refused.line("docs")}`', '',
+                            f'The release `{tag}` is published and stays as it is. ' + refused.manual.replace('by hand: ', 'by hand:\n\n    ')])
+        raise
+    record.update(state='live', observed_version=observed)
+    write_receipt(args.receipt, receipt)
+    summarize(summary, ['### Docs deployed', '', f'- Release: `{tag}` (docs built from `{ref}`)',
+                        f'- Deploy run: [{run_id}]({url})', f'- The docs site shows: `{observed}`'])
+    return f'DOCS {tag} deploy run {run_id} succeeded; the docs site shows {observed}'
+
+
 def sole_reviewer_problem(environment, required):
     """The GO is one person's: one required-reviewer rule naming exactly that User and nobody else.
 
@@ -700,6 +894,12 @@ def build_parser():
     put.add_argument('--mode', required=True)
     put.add_argument('--bundle', type=Path, required=True)
     put.add_argument('--receipt', type=Path, required=True)
+    site = commands.add_parser('docs')
+    site.add_argument('--api', default=API)
+    site.add_argument('--site', default=DOCS_DEPLOY['site'])
+    site.add_argument('--tag', required=True)
+    site.add_argument('--mode', required=True)
+    site.add_argument('--receipt', type=Path, required=True)
     fix = commands.add_parser('recover')
     fix.add_argument('--api', default=API)
     fix.add_argument('--repo', required=True)
@@ -722,10 +922,14 @@ def main(argv=None, env=None):
             print(preflight(args, env.get('PREFLIGHT_TOKEN', ''), env.get('RELEASE_REQUIRED_REVIEWER', '').strip()))
         elif args.command == 'fetch':
             print(fetch(args, env.get('READER_TOKEN', '')))
+        elif args.command == 'docs':
+            print(docs(args, env.get('DOCS_TOKEN', ''), env.get('GITHUB_STEP_SUMMARY', '')))
         else:
             print(publish(args, env.get('PUBLISH_TOKEN', '')))
     except Refused as refused:
         print(refused.line(args.command), file=sys.stderr)
+        if getattr(refused, 'manual', None):
+            print(refused.manual, file=sys.stderr)
         return 1
     except Exception as error:  # noqa: BLE001,F841 - never print exception text to a public log
         print(Refused('INTERNAL_ERROR').line(args.command), file=sys.stderr)
