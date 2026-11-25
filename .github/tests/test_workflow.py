@@ -191,8 +191,9 @@ def guard_docs(doc):
             f'{step_id}: mode=publish only, and only after every earlier step succeeded'
     job = doc['jobs']['publish']
     assert job.get('environment') == 'release', 'the docs App ID and key are release environment settings'
-    assert step(doc, 'docs').get('timeout-minutes') == 30, 'the docs step is bounded: find, a 20-minute wait, a 5-minute live check'
-    assert job.get('timeout-minutes') >= 60, 'the job leaves room for the publish and the docs step'
+    assert step(doc, 'docs').get('timeout-minutes') == 40, \
+        'the docs step is bounded above publish.py\'s own deadlines (2 + 20 + 5 minutes and the request timeouts)'
+    assert job.get('timeout-minutes') >= 30 + 40, 'the job leaves the publish its 30 minutes, plus the docs step'
 
 
 def guard_pinned(doc, raw):
@@ -268,8 +269,8 @@ MUTATIONS = [
     (guard_docs, lambda d: find(d, 'docs').pop('if'), 'docs: mode=publish only'),
     (guard_docs, lambda d: find(d, 'docs').update({'if': "always() && inputs.mode == 'publish'"}), 'docs: mode=publish only'),
     (guard_docs, lambda d: find(d, 'docs-token').update({'if': 'always()'}), 'docs-token: mode=publish only'),
-    (guard_docs, lambda d: find(d, 'docs').pop('timeout-minutes'), 'the docs step is bounded'),
-    (guard_docs, lambda d: d['jobs']['publish'].update({'timeout-minutes': 30}), 'the job leaves room'),
+    (guard_docs, lambda d: find(d, 'docs').update({'timeout-minutes': 30}), 'the docs step is bounded'),
+    (guard_docs, lambda d: d['jobs']['publish'].update({'timeout-minutes': 60}), 'the job leaves the publish its 30 minutes'),
     (guard_credentials, lambda d: find(d, 'docs-token')['with'].update(repositories='daana-cli,daana'), 'the docs token: the source repository only'),
     (guard_credentials, lambda d: find(d, 'docs-token')['with'].update({'permission-contents': 'write'}), 'the docs token: the source repository only'),
     (guard_credentials, lambda d: find(d, 'docs-token').update(uses='actions/create-github-app-token@v2'), 'pinned by SHA'),

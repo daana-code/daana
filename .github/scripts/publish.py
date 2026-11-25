@@ -37,9 +37,10 @@ Nothing is built here. Standard library only.
       publish and the receipt records a confirmed publish of TAG. Dispatch the
       source repository's docs deploy (DOCS_DEPLOY) at the candidate tag (the
       source the bytes were built from) with the version TAG and the hosted
-      runner, find the one run that dispatch created, wait for it to succeed,
-      then read the version the docs site's badge shows, with no credential,
-      until it is TAG. Each step is recorded under `docs` in the receipt and in
+      runner, find the one run that dispatch created, require it to build the
+      candidate's commit (the receipt's tag_commit) and wait for it to succeed,
+      then read the version the docs site's badge shows (its
+      data-daana-version attribute), with no credential, until it is TAG. Each step is recorded under `docs` in the receipt and in
       the job summary. It never touches the release; a failure names the
       manual re-dispatch. Token: DOCS_TOKEN (the Docs Dispatch App, Actions:
       write on the source repository only).
@@ -115,13 +116,25 @@ DOCS_DEPLOY = {
     'runner': 'hosted',
     'site': 'https://docs.daana.dev/',
 }
-# The badge as the site renders it: aria-label="Daana CLI <version>".
-DOCS_BADGE = re.compile(r'aria-label="Daana CLI ([^"<>]{1,64})"')
+# The version badge carries data-daana-version="<version>" (daana-cli
+# docs-site VersionBadge.tsx; a daana-cli test pins it). Only that attribute is
+# read, and only a version-shaped value counts: the page has other
+# `aria-label="Daana CLI ..."` labels (the logo's "docs home", "on GitHub").
+DOCS_VERSION_ATTRIBUTE = re.compile(r'\bdata-daana-version="([^"<>]{0,64})"')
+DOCS_VERSION_SHAPE = re.compile(r'v[0-9]+\.[0-9]+\.[0-9]+(?:-rc\.[0-9]+)?')
+# Transition only: a site deployed before the attribute existed shows the version
+# only as the badge's aria-label. Used when the page has no attribute at all.
+DOCS_LEGACY_BADGE = re.compile(r'aria-label="Daana CLI (v[0-9][^"<>]{0,63})"')
 # Bounds, in seconds; tests shorten them. The live check allows for CDN propagation.
 DOCS_FIND_SECONDS = 120
 DOCS_WAIT_SECONDS = 20 * 60
 DOCS_LIVE_SECONDS = 5 * 60
 DOCS_POLL_SECONDS = 10
+# Each docs request (GitHub or the site) gives up after this, so no request runs
+# far past a deadline; the step's timeout-minutes covers the sum of all three.
+DOCS_REQUEST_SECONDS = 30
+# The run conclusions printed as they are; anything else prints as `other`.
+DOCS_CONCLUSIONS = ('failure', 'cancelled', 'timed_out', 'action_required', 'neutral', 'skipped', 'stale', 'startup_failure')
 # How far the runner's clock may be ahead of GitHub's when matching the new run.
 DOCS_CLOCK_SKEW = timedelta(seconds=10)
 DOCS_PAGE_BYTES = 5 * 1024 ** 2
@@ -275,8 +288,9 @@ class _NoAuthRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class GitHub:
-    def __init__(self, api, repo, token):
+    def __init__(self, api, repo, token, timeout=None):
         self.api, self.repo, self.token = api.rstrip('/'), repo, token
+        self.timeout = timeout
         self.opener = urllib.request.build_opener(_NoAuthRedirect)
 
     def request(self, method, url, payload=None, data=None, headers=None, raw=False, sink=None):
@@ -292,7 +306,7 @@ class GitHub:
         for key, value in (headers or {}).items():
             request.add_header(key, value)
         try:
-            with self.opener.open(request, timeout=TIMEOUT) as response:
+            with self.opener.open(request, timeout=self.timeout or TIMEOUT) as response:
                 if sink is not None:
                     total = 0
                     while True:
@@ -585,7 +599,7 @@ def publish_verified(github, args, files, body, manifest):
     release = github.request('POST', '/releases', payload={
         'tag_name': draft_tag, 'name': name, 'body': body, 'draft': True, 'prerelease': '-' in draft_tag})
     receipt = {'schema_version': 1, 'repository': args.repo, 'tag': draft_tag, 'release_tag': tag,
-               'candidate_tag': manifest['candidate_tag'],
+               'candidate_tag': manifest['candidate_tag'], 'tag_commit': manifest['tag_commit'],
                'mode': mode, 'prepare_run_id': manifest['prepare_run_id'], 'tag_run_id': manifest['tag_run_id'],
                'release_id': release['id'], 'state': 'draft-created', 'published': False, 'assets': []}
     write_receipt(args.receipt, receipt, new=True)
@@ -678,7 +692,8 @@ def docs_receipt_ok(receipt, tag):
     candidate = str(receipt.get('candidate_tag'))
     return (receipt.get('mode') == 'publish' and receipt.get('state') == 'published' and receipt.get('published') is True
             and receipt.get('tag') == tag and receipt.get('release_tag') == tag
-            and TAG.fullmatch(candidate) is not None and not is_rehearsal(candidate) and ships_candidate(tag, candidate))
+            and TAG.fullmatch(candidate) is not None and not is_rehearsal(candidate) and ships_candidate(tag, candidate)
+            and HEX40.fullmatch(str(receipt.get('tag_commit'))) is not None)
 
 
 def docs_call(call, *args, **kwargs):
@@ -695,7 +710,9 @@ def find_docs_run(source, ref, since):
     while True:
         try:
             listed = source.request('GET', f"/actions/workflows/{DOCS_DEPLOY['workflow']}/runs?event=workflow_dispatch&per_page=30")
-        except ApiError:
+        except ApiError as error:
+            if error.status in (401, 403):
+                raise Refused('DOCS_API_FAILED', status=error.status) from None
             listed = None
         runs = listed.get('workflow_runs') if isinstance(listed, dict) else None
         found = []
@@ -717,36 +734,48 @@ def find_docs_run(source, ref, since):
         time.sleep(DOCS_POLL_SECONDS)
 
 
-def wait_docs_run(source, run_id, ref):
+def wait_docs_run(source, run_id, ref, commit):
     """Wait, within DOCS_WAIT_SECONDS, for the run to complete; it must succeed."""
     deadline = time.monotonic() + DOCS_WAIT_SECONDS
     while True:
         try:
             run = source.request('GET', f'/actions/runs/{run_id}')
         except ApiError as error:
-            if error.status in (401, 403, 404):
+            if error.status in (401, 403):
                 raise Refused('DOCS_API_FAILED', status=error.status, run=run_id) from None
-            run = None
-        if isinstance(run, dict) and (run.get('id') != run_id or run.get('head_branch') != ref):
+            run = False
+        if run is None:  # a GET 404: the run is gone
+            raise Refused('DOCS_RUN_NOT_FOUND', run=run_id)
+        if isinstance(run, dict) and (run.get('id') != run_id or run.get('head_branch') != ref or run.get('head_sha') != commit):
             raise Refused('DOCS_RUN_CHANGED', run=run_id)
         if isinstance(run, dict) and run.get('status') == 'completed':
             if run.get('conclusion') != 'success':
-                raise Refused('DOCS_DEPLOY_FAILED', run=run_id, conclusion=str(run.get('conclusion')))
+                conclusion = run.get('conclusion')
+                raise Refused('DOCS_DEPLOY_FAILED', run=run_id, conclusion=conclusion if conclusion in DOCS_CONCLUSIONS else 'other')
             return
         if time.monotonic() >= deadline:
             raise Refused('DOCS_DEPLOY_TIMEOUT', run=run_id)
         time.sleep(DOCS_POLL_SECONDS)
 
 
+def page_versions(page):
+    """The version-shaped values of the badge's data-daana-version; on a page that
+    predates the attribute, of the badge's aria-label. Other labels never count."""
+    values = DOCS_VERSION_ATTRIBUTE.findall(page)
+    if not values:
+        values = DOCS_LEGACY_BADGE.findall(page)
+    return {value for value in values if DOCS_VERSION_SHAPE.fullmatch(value)}
+
+
 def site_versions(site):
     """Every version the site's badge shows, read with no credential; empty when unreadable."""
     request = urllib.request.Request(site, headers={'Cache-Control': 'no-cache', 'User-Agent': 'daana-publish-docs-check'})
     try:
-        with urllib.request.build_opener().open(request, timeout=min(TIMEOUT, 60)) as response:
+        with urllib.request.build_opener().open(request, timeout=min(TIMEOUT, DOCS_REQUEST_SECONDS)) as response:
             page = response.read(DOCS_PAGE_BYTES).decode('utf-8', 'replace')
     except (urllib.error.URLError, OSError, http.client.HTTPException, ValueError):
         return set()
-    return set(DOCS_BADGE.findall(page))
+    return page_versions(page)
 
 
 def wait_live(site, tag):
@@ -792,16 +821,20 @@ def docs(args, token, summary):
               'ref': ref, 'version': tag, 'runner': DOCS_DEPLOY['runner']}
     receipt['docs'] = record
     write_receipt(args.receipt, receipt)
-    source = GitHub(args.api, DOCS_DEPLOY['repo'], token)
+    source = GitHub(args.api, DOCS_DEPLOY['repo'], token, timeout=min(TIMEOUT, DOCS_REQUEST_SECONDS))
     try:
         since = now().replace(microsecond=0) - DOCS_CLOCK_SKEW
         docs_call(source.request, 'POST', f"/actions/workflows/{DOCS_DEPLOY['workflow']}/dispatches", payload={
             'ref': ref, 'inputs': {DOCS_DEPLOY['version_input']: tag, DOCS_DEPLOY['runner_input']: DOCS_DEPLOY['runner']}})
-        run_id = find_docs_run(source, ref, since)['id']
+        run = find_docs_run(source, ref, since)
+        run_id = run['id']
         url = f"https://github.com/{DOCS_DEPLOY['repo']}/actions/runs/{run_id}"
         record.update(state='deploying', run_id=run_id, run_url=url)
         write_receipt(args.receipt, receipt)
-        wait_docs_run(source, run_id, ref)
+        # The ref is a short name: the run must have built the candidate's own commit.
+        if run.get('head_sha') != receipt['tag_commit']:
+            raise Refused('DOCS_RUN_OTHER_COMMIT', run=run_id)
+        wait_docs_run(source, run_id, ref, receipt['tag_commit'])
         record.update(state='deployed')
         write_receipt(args.receipt, receipt)
         observed = wait_live(args.site, tag)

@@ -44,7 +44,7 @@ jobs:
     if: github.ref == 'refs/heads/main'
     environment: release
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 75
     permissions:
       contents: read
       actions: read # the preflight reads this environment's protection
@@ -127,7 +127,9 @@ jobs:
       - name: Deploy the docs and check they are live
         id: docs
         if: inputs.mode == 'publish'
-        timeout-minutes: 30
+        # Above the sum of publish.py's own bounds (2 + 20 + 5 minutes, each request
+        # at most 30 s), so its REFUSED line and the manual command always print.
+        timeout-minutes: 40
         env:
           DOCS_TOKEN: ${{ steps.docs-token.outputs.token }}
           RELEASE_TAG: ${{ inputs.release_tag }}
